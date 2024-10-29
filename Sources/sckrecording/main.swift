@@ -98,17 +98,15 @@ struct ScreenRecorder {
         videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         videoInput.expectsMediaDataInRealTime = true
 
-        // 创建音频输入
         let audioSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 44100,
             AVNumberOfChannelsKey: 2,
             AVEncoderBitRateKey: 192000
         ]
-        
+
         audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
         audioInput.expectsMediaDataInRealTime = true
-
         // 添加输入到 assetWriter
         guard assetWriter.canAdd(videoInput) else {
             throw RecordingError("Can't add video input to asset writer")
@@ -135,11 +133,26 @@ struct ScreenRecorder {
         guard let display = sharableContent.displays.first(where: { $0.displayID == displayID }) else {
             throw RecordingError("Can't find display with ID \(displayID) in sharable content")
         }
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        // 打印显示器信息
+        print("=== Display Information ===")
+        for display in sharableContent.displays {
+            print("Display ID: \(display.displayID)")
+            print("Display Width: \(display.width)")
+            print("Display Height: \(display.height)")
+            print("-------------------")
+        }
 
+        // 创建过滤器 - 注意这里的语法变化
+        let filter = SCContentFilter(
+            display: display,
+            excludingWindows: []
+        )
         let configuration = SCStreamConfiguration()
+        configuration.capturesAudio = true  // 添加这行
+        configuration.excludesCurrentProcessAudio = false  // 添加这行，允许捕获当前进程的音频
         configuration.queueDepth = 6
 
+        // 设置视频尺寸
         if let cropRect = cropRect {
             configuration.sourceRect = cropRect
             configuration.width = Int(cropRect.width) * displayScaleFactor
@@ -160,7 +173,7 @@ struct ScreenRecorder {
 
         // 创建并配置 SCStream
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
-        
+
         // 添加视频和音频输出
         try stream.addStreamOutput(streamOutput, type: .screen, sampleHandlerQueue: videoSampleBufferQueue)
         try stream.addStreamOutput(streamOutput, type: .audio, sampleHandlerQueue: audioSampleBufferQueue)
@@ -215,7 +228,6 @@ struct ScreenRecorder {
         }
 
         func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-
             // Return early if session hasn't started yet
             guard sessionStarted else { return }
 
@@ -232,7 +244,6 @@ struct ScreenRecorder {
                 let status = SCFrameStatus(rawValue: statusRawValue),
                 status == .complete
             else { return }
-
 
 
             switch type {
@@ -266,6 +277,7 @@ struct ScreenRecorder {
                 }
 
             case .audio:
+                print("Received audio data (type: \(type.rawValue))")
                 if audioInput.isReadyForMoreMediaData {
                     print("🎵 Processing audio sample buffer")
                     if firstSampleTime == .zero {
@@ -292,7 +304,6 @@ struct ScreenRecorder {
                 } else {
                     print("⚠️ Audio input not ready for more data")
                 }
-
             @unknown default:
                 break
             }
