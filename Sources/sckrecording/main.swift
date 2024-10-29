@@ -49,11 +49,14 @@ do {
 
 struct ScreenRecorder {
     private let videoSampleBufferQueue = DispatchQueue(label: "ScreenRecorder.VideoSampleBufferQueue")
+    private let audioSampleBufferQueue = DispatchQueue(label: "ScreenRecorder.AudioSampleBufferQueue")
 
     private let assetWriter: AVAssetWriter
     private let videoInput: AVAssetWriterInput
+    private let audioInput: AVAssetWriterInput
     private let streamOutput: StreamOutput
     private var stream: SCStream
+    private var audioData: [CMSampleBuffer] = []
 
     init(url: URL, displayID: CGDirectDisplayID, cropRect: CGRect?, mode: RecordMode) async throws {
 
@@ -102,8 +105,23 @@ struct ScreenRecorder {
         // Create AVAssetWriter input for video, based on the output settings from the Assistant
         videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         videoInput.expectsMediaDataInRealTime = true
-        streamOutput = StreamOutput(videoInput: videoInput)
 
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey: 192000
+        ]
+
+        audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        audioInput.expectsMediaDataInRealTime = true
+
+        guard assetWriter.canAdd(audioInput) else {
+            throw RecordingError("Can't add audio input to asset writer")
+        }
+        assetWriter.add(audioInput)
+        // 修改StreamOutput初始化
+        streamOutput = StreamOutput(videoInput: videoInput, audioInput: audioInput)
         // Adding videoInput to assetWriter
         guard assetWriter.canAdd(videoInput) else {
             throw RecordingError("Can't add input to asset writer")
@@ -193,17 +211,21 @@ struct ScreenRecorder {
 
         // Finish writing
         videoInput.markAsFinished()
+        audioInput.markAsFinished()
         await assetWriter.finishWriting()
     }
 
     private class StreamOutput: NSObject, SCStreamOutput {
         let videoInput: AVAssetWriterInput
+        let audioInput: AVAssetWriterInput
         var sessionStarted = false
         var firstSampleTime: CMTime = .zero
         var lastSampleBuffer: CMSampleBuffer?
 
-        init(videoInput: AVAssetWriterInput) {
+        init(videoInput: AVAssetWriterInput, audioInput: AVAssetWriterInput) {
             self.videoInput = videoInput
+            self.audioInput = audioInput
+            super.init()
         }
 
         func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -216,14 +238,15 @@ struct ScreenRecorder {
 
             // Retrieve the array of metadata attachments from the sample buffer
             guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-                  let attachments = attachmentsArray.first
+                let attachments = attachmentsArray.first
             else { return }
 
-            // Validate the status of the frame. If it isn't `.complete`, return
+            // Validate the status of the frame
             guard let statusRawValue = attachments[SCStreamFrameInfo.status] as? Int,
-                  let status = SCFrameStatus(rawValue: statusRawValue),
-                  status == .complete
+                let status = SCFrameStatus(rawValue: statusRawValue),
+                status == .complete
             else { return }
+
 
 
             switch type {
@@ -257,7 +280,33 @@ struct ScreenRecorder {
                 }
 
             case .audio:
-                break
+                if audioInput.isReadyForMoreMediaData {
+                    print("🎵 Processing audio sample buffer")
+
+                    if firstSampleTime == .zero {
+                        firstSampleTime = sampleBuffer.presentationTimeStamp
+                        print("🎵 First audio sample time set to: \(firstSampleTime.seconds)")
+                    }
+
+                    let lastSampleTime = sampleBuffer.presentationTimeStamp - firstSampleTime
+                    print("🎵 Audio timing - presentationTime: \(sampleBuffer.presentationTimeStamp.seconds), lastSampleTime: \(lastSampleTime.seconds)")
+
+                    let timing = CMSampleTimingInfo(
+                        duration: sampleBuffer.duration,
+                        presentationTimeStamp: lastSampleTime,
+                        decodeTimeStamp: sampleBuffer.decodeTimeStamp
+                    )
+                    print("🎵 Audio sample duration: \(sampleBuffer.duration.seconds)")
+
+                    if let retimedSampleBuffer = try? CMSampleBuffer(copying: sampleBuffer, withNewTiming: [timing]) {
+                        audioInput.append(retimedSampleBuffer)
+                        print("🎵 Successfully appended audio sample")
+                    } else {
+                        print("❌ Failed to copy audio sample buffer")
+                    }
+                } else {
+                    print("⚠️ Audio input not ready for more data")
+                }
 
             @unknown default:
                 break
