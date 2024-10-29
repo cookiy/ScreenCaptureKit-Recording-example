@@ -59,17 +59,13 @@ struct ScreenRecorder {
     private var audioData: [CMSampleBuffer] = []
 
     init(url: URL, displayID: CGDirectDisplayID, cropRect: CGRect?, mode: RecordMode) async throws {
-
         // Create AVAssetWriter for a QuickTime movie file
         self.assetWriter = try AVAssetWriter(url: url, fileType: .mov)
 
         // MARK: AVAssetWriter setup
-
-        // Get size and pixel scale factor for display
-        // Used to compute the highest possible qualitiy
         let displaySize = CGDisplayBounds(displayID).size
 
-        // The number of physical pixels that represent a logic point on screen, currently 2 for MacBook Pro retina displays
+        // The number of physical pixels that represent a logic point on screen
         let displayScaleFactor: Int
         if let mode = CGDisplayCopyDisplayMode(displayID) {
             displayScaleFactor = mode.pixelWidth / mode.width
@@ -77,11 +73,9 @@ struct ScreenRecorder {
             displayScaleFactor = 1
         }
 
-        // AVAssetWriterInput supports maximum resolution of 4096x2304 for H.264
         // Downsize to fit a larger display back into in 4K
         let videoSize = downsizedVideoSize(source: cropRect?.size ?? displaySize, scaleFactor: displayScaleFactor, mode: mode)
 
-        // Use the preset as large as possible, size will be reduced to screen size by computed videoSize
         guard let assistant = AVOutputSettingsAssistant(preset: mode.preset) else {
             throw RecordingError("Can't create AVOutputSettingsAssistant")
         }
@@ -92,41 +86,42 @@ struct ScreenRecorder {
         }
         outputSettings[AVVideoWidthKey] = videoSize.width
         outputSettings[AVVideoHeightKey] = videoSize.height
-
-        // Configure video color properties and compression properties based on RecordMode
-        // See AVVideoSettings.h and VTCompressionProperties.h
         outputSettings[AVVideoColorPropertiesKey] = mode.videoColorProperties
+        
         if let videoProfileLevel = mode.videoProfileLevel {
             var compressionProperties: [String: Any] = outputSettings[AVVideoCompressionPropertiesKey] as? [String: Any] ?? [:]
             compressionProperties[AVVideoProfileLevelKey] = videoProfileLevel
             outputSettings[AVVideoCompressionPropertiesKey] = compressionProperties as NSDictionary
         }
 
-        // Create AVAssetWriter input for video, based on the output settings from the Assistant
+        // 创建视频输入
         videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         videoInput.expectsMediaDataInRealTime = true
 
+        // 创建音频输入
         let audioSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 44100,
             AVNumberOfChannelsKey: 2,
             AVEncoderBitRateKey: 192000
         ]
-
+        
         audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
         audioInput.expectsMediaDataInRealTime = true
+
+        // 添加输入到 assetWriter
+        guard assetWriter.canAdd(videoInput) else {
+            throw RecordingError("Can't add video input to asset writer")
+        }
+        assetWriter.add(videoInput)
 
         guard assetWriter.canAdd(audioInput) else {
             throw RecordingError("Can't add audio input to asset writer")
         }
         assetWriter.add(audioInput)
-        // 修改StreamOutput初始化
+
+        // 创建 StreamOutput
         streamOutput = StreamOutput(videoInput: videoInput, audioInput: audioInput)
-        // Adding videoInput to assetWriter
-        guard assetWriter.canAdd(videoInput) else {
-            throw RecordingError("Can't add input to asset writer")
-        }
-        assetWriter.add(videoInput)
 
         guard assetWriter.startWriting() else {
             if let error = assetWriter.error {
@@ -136,8 +131,6 @@ struct ScreenRecorder {
         }
 
         // MARK: SCStream setup
-
-        // Create a filter for the specified display
         let sharableContent = try await SCShareableContent.current
         guard let display = sharableContent.displays.first(where: { $0.displayID == displayID }) else {
             throw RecordingError("Can't find display with ID \(displayID) in sharable content")
@@ -145,15 +138,9 @@ struct ScreenRecorder {
         let filter = SCContentFilter(display: display, excludingWindows: [])
 
         let configuration = SCStreamConfiguration()
+        configuration.queueDepth = 6
 
-        // Increase the depth of the frame queue to ensure high fps at the expense of increasing
-        // the memory footprint of WindowServer.
-        configuration.queueDepth = 6 // 4 minimum, or it becomes very stuttery
-
-        // Make sure to take displayScaleFactor into account
-        // otherwise, image is scaled up and gets blurry
         if let cropRect = cropRect {
-            // ScreenCaptureKit uses top-left of screen as origin
             configuration.sourceRect = cropRect
             configuration.width = Int(cropRect.width) * displayScaleFactor
             configuration.height = Int(cropRect.height) * displayScaleFactor
@@ -162,22 +149,21 @@ struct ScreenRecorder {
             configuration.height = Int(displaySize.height) * displayScaleFactor
         }
 
-        // Set pixel format an color space, see CVPixelBuffer.h
         switch mode {
         case .h264_sRGB:
-            configuration.pixelFormat = kCVPixelFormatType_32BGRA // 'BGRA'
+            configuration.pixelFormat = kCVPixelFormatType_32BGRA
             configuration.colorSpaceName = CGColorSpace.sRGB
         case .hevc_displayP3:
-            configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked // 'l10r'
+            configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked
             configuration.colorSpaceName = CGColorSpace.displayP3
-//        case .hevc_displayP3_HDR:
-//            configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked // 'l10r'
-//            configuration.colorSpaceName = CGColorSpace.displayP3
         }
 
-        // Create SCStream and add local StreamOutput object to receive samples
+        // 创建并配置 SCStream
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
+        
+        // 添加视频和音频输出
         try stream.addStreamOutput(streamOutput, type: .screen, sampleHandlerQueue: videoSampleBufferQueue)
+        try stream.addStreamOutput(streamOutput, type: .audio, sampleHandlerQueue: audioSampleBufferQueue)
     }
 
     func start() async throws {
@@ -282,7 +268,6 @@ struct ScreenRecorder {
             case .audio:
                 if audioInput.isReadyForMoreMediaData {
                     print("🎵 Processing audio sample buffer")
-
                     if firstSampleTime == .zero {
                         firstSampleTime = sampleBuffer.presentationTimeStamp
                         print("🎵 First audio sample time set to: \(firstSampleTime.seconds)")
